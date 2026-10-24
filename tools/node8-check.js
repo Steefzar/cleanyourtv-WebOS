@@ -16,7 +16,7 @@ const files = fs.readdirSync(helper).filter(f => /\.js$/.test(f)).map(f => path.
 for (const f of files) { const r = cp.spawnSync(process.execPath, ['--check', f], { encoding: 'utf8' }); ok(r.status === 0, 'syntax ' + path.relative(root, f) + (r.status ? '\n' + r.stderr : '')); }
 
 // 2. modules load (helper.js starts the service, so it is only parsed above)
-for (const m of ['netcompat', 'notify', 'notifyapi', 'sharelog', 'picker', 'inputhook', 'manager', 'live', 'voice', 'theme']) { try { require(path.join(helper, m)); ok(true, 'loads ' + m); } catch (e) { ok(false, 'loads ' + m + ': ' + e.message); } }
+for (const m of ['netcompat', 'notify', 'notifyapi', 'sharelog', 'picker', 'inputhook', 'manager', 'live', 'voice', 'theme', 'running']) { try { require(path.join(helper, m)); ok(true, 'loads ' + m); } catch (e) { ok(false, 'loads ' + m + ': ' + e.message); } }
 
 const nc = require(path.join(helper, 'netcompat'));
 const call = (fn, url, method, body) => new Promise((resolve, reject) => {
@@ -349,6 +349,36 @@ const fake = (url, method) => { const res = { code: 0, out: '', writeHead(c) { t
   await new Promise(r => setTimeout(r, 1700)); pg = await getPage(pagePath); ok(pg.code === 401, 'the page stops working after its time');
   ninfo = napiMod.set({ page: true }); nconf.notifyApi.allow = ['10.0.0.0/24']; pg = await getPage('/t/' + ninfo.pageUrl.split('/t/')[1]); ok(pg.code === 403, 'the allow list applies to the page too');
   delete process.env.CYTV_NOTIFY_PAGE_MS; napiMod.set({ enabled: false });
+  // 16. Running apps (Back on Home): only the apps the launcher knows are listed, never Home or CleanYourTV's own apps, and only listed apps
+  // can be closed; closing also drops the app from LG's recents, as LG's own panel does
+  const runMod = require(path.join(helper, 'running'));
+  const tiles = [{ id: 'youtube.leanback.v4', title: 'YouTube' }, { id: 'netflix', title: 'Netflix' }, { id: 'com.cleanyourtv.manager', title: 'CleanYourTV' }];
+  ok(JSON.stringify(runMod.pick([{ id: 'com.webos.app.home' }, { id: 'youtube.leanback.v4' }, { id: 'com.cleanyourtv.picker' }, { id: 'com.cleanyourtv.manager' },
+    { id: 'com.webos.app.livetv' }, { appId: 'netflix' }, { id: 'youtube.leanback.v4' }], tiles)) === JSON.stringify([{ id: 'youtube.leanback.v4', title: 'YouTube' }, { id: 'netflix', title: 'Netflix' }]),
+    'running apps: only apps the launcher knows, once each, without Home or CleanYourTV\'s own apps');
+  let lunaCalls = [], lunaRunning = { returnValue: true, running: [{ id: 'com.webos.app.home' }, { id: 'youtube.leanback.v4' }, { id: 'netflix' }] }, lunaFail = '';
+  const runApi = runMod.create(async (uri, p) => {
+    const m = uri.split('/').pop(); lunaCalls.push(m + ' ' + JSON.stringify(p));
+    if (m === 'running') return lunaRunning;
+    return m === lunaFail ? { returnValue: false, errorText: 'no' } : { returnValue: true };
+  }, async () => tiles);
+  const runCall = async (u, b) => { const x = fake(u, b ? 'POST' : 'GET'); lunaCalls = []; await runApi.handle(x.req, x.res, u, async () => b || {}); return JSON.parse(x.res.out); };
+  const closedIds = () => lunaCalls.filter(c => /^(closeByAppId|close) /.test(c)).map(c => JSON.parse(c.split(' ')[1]).id);
+  ok((await runCall('/api/running')).apps.map(a => a.id).join() === 'youtube.leanback.v4,netflix', 'GET /api/running lists them');
+  let rr = await runCall('/api/running/close', { id: 'netflix' });
+  ok(rr.returnValue === true && closedIds().join() === 'netflix' && lunaCalls.indexOf('removeRecent {"appId":"netflix"}') >= 0, 'closing an app closes it and drops it from the recents');
+  for (const id of ['com.webos.app.home', 'com.cleanyourtv.picker', 'org.example.notrunning']) {
+    rr = await runCall('/api/running/close', { id });
+    ok(rr.returnValue === false && !closedIds().length && !lunaCalls.some(c => /^removeRecent /.test(c)), 'an app that is not listed is not closed: ' + id);
+  }
+  rr = await runCall('/api/running/close', { all: true });
+  ok(rr.returnValue === true && closedIds().join() === 'youtube.leanback.v4,netflix', 'close all closes every listed app and nothing else');
+  lunaFail = 'closeByAppId'; rr = await runCall('/api/running/close', { id: 'netflix' });
+  ok(rr.returnValue === true && lunaCalls.some(c => /^close \{"id":"netflix"\}/.test(c)), 'when closeByAppId fails, plain close is used');
+  lunaFail = 'removeRecent'; rr = await runCall('/api/running/close', { id: 'netflix' });
+  ok(rr.returnValue === true, 'a TV without LG\'s recents service still closes the app');
+  lunaFail = ''; lunaRunning = { returnValue: false, errorText: 'busy' }; rr = await runCall('/api/running');
+  ok(Array.isArray(rr.apps) && !rr.apps.length && rr.error, 'when the app manager does not answer, the list is empty and says why');
 
   console.log(failed ? '\n' + failed + ' check(s) failed on Node ' + process.version : '\nall checks passed on Node ' + process.version);
   fs.rmSync ? fs.rmSync(tmp, { recursive: true, force: true }) : cp.spawnSync('rm', ['-rf', tmp]);
